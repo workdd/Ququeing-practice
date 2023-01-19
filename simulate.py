@@ -36,7 +36,7 @@ plt.show()
 
 
 TARGET_LATENCY = 200 #ms
-T = [1,2,3,5,10,30,60,180]
+T = [1,5,10,30,60,180]
 
 default = {}
 for t in T:
@@ -66,6 +66,68 @@ InferentiaInstances = 0
 InferentiaJobs = 0
 LambdaWorkers = 0
 
+class Queue(object):
+    """
+    Create the initial object queue
+    """
+
+    def __init__(self, env, servers, servicetime):
+        self.env = env
+        self.server = simpy.Resource(env, servers)
+        self.servicetime = servicetime
+
+    def service(self, customer):
+        """The process"""
+        yield self.env.timeout(1/MU)
+
+def customer(env, name, qu):
+    """Each customer has a ``name`` and requests a server
+    Subsequently, it starts a process.
+    need to do sthis differently though...
+    """
+
+    global arrivals
+
+    a = env.now
+    # print(f'{name} arrives at the servicedesk at {a:.2f}')
+    arrivals += 1
+
+    with qu.server.request() as request:
+        yield request
+
+        global counter
+        global waiting_time
+        global leavers
+
+        b = env.now
+        # print('%s enters the servicedesk at %.2f.' % (name, b))
+        waitingtime = (b - a)
+        # print(f'{name} waiting time was {waitingtime:.2f}')
+        waiting_time += waitingtime
+        counter += 1
+
+        yield env.process(qu.service(name))
+        # print('%s leaves the servicedesk at %.2f.' % (name, env.now))
+        leavers += 1
+        
+        
+def setup(env, servers, servicetime, t_inter):
+    """Create a queue, a number of initial customers and keep creating customers
+    approx. every 1/lambda*60 minutes."""
+    # Generate queue
+    queue = Queue(env, SERVERS, MU)
+
+    # Create 1 initial customer
+    # for i in range(1):
+    i = 0
+    env.process(customer(env, f'Customer {i}', queue))
+
+    # Create more customers while the simulation is running
+    while True:
+        yield env.timeout(np.random.exponential(1/LAMBDA, 1)[0])
+        i += 1
+        env.process(customer(env, f'Customer {i}', queue))
+
 # Time Step 별 도착하는 Event 양 체크
 def RequestMonitor(start_time):
     requests = copy.deepcopy(default)
@@ -81,41 +143,72 @@ start_time = 0
 end_time = 59
 
 instance_start_time = 0
+SIMULATIONS = 10
 
 while(start_time <= end_time):
     print("Current Time:", start_time)
     
     Events = RequestMonitor(start_time)
     print(Events)
+
+    TotalEventValues = np.array(list(Events.values()))
+    ComparedEventValues = np.array(list(Events.values()))
     
     # 인스턴스 실행중인 경우
-    EventValues = np.array(list(Events.values()))
     if InferentiaInstances > 0:
+        ### SETTINGS
+        # Set RHO to a little bit smaller then 1; makes the simulation interesting
+        # RHO = 서버 활용도
+        # MU > LAMBDA, if  mu = 1 and c is 1 otherwise no queue.
+        # 1/MU > 1/LAMBDA if c=2 or higher?
+        # If mu = 2, avg is every 0.5 time step is the time costs of a service.
+        # suppose lambda < 1
         InferentiaJobs += Events[1]
-        EventValues -= np.array(list(PerformInferentia.values())) * InferentiaInstances
-    
-    print(EventValues)
-    
+        ComparedEventValues -= np.array(list(PerformInferentia.values())) * InferentiaInstances
+        
+        print('Servers:', InferentiaInstances)
+        # SIM_TIME: simulation time in time units
+        time_idx =0 
+        for TimeKey, SIM_TIME in PerformInferentia.items():
+            MU = SIM_TIME # 1/mu is exponential service times
+            
+            SERVERS = InferentiaInstances
+            LAMBDA = TotalEventValues[time_idx]
+            RHO = LAMBDA / (MU * SERVERS)
+            
+            print("SIM_TIME:",SIM_TIME)
+            print("EXPECTED VALUES AND PROBABILITIES")
+
+            print(f'Rho: {RHO}\nMu: {MU}\nLambda: {LAMBDA}\nExpected interarrival time: {1 / LAMBDA:.5f} time units')
+            print(f'Expected processing time per server: {1 / MU:.5f} time units\n')
+            print(f'Probability that a job has to wait: {pwait(SERVERS, RHO):.5f}')
+            print(f'Expected waiting time E(W): {expw(MU, SERVERS, RHO):.5f} time units')
+            print(f'Expected queue length E(Lq): {expquel(SERVERS, RHO):.5f} customers\n')
+            time_idx +=1
+            
+            E = expw(MU, SERVERS, RHO)
+            if E > TARGET_LATENCY / 1000:
+                print("Violate Target Latency")
     print("Lambda_Workers:",LambdaWorkers)
     print("InferentiaInstances:",InferentiaInstances, "Worked by Inferentia Job:", InferentiaJobs)    
     
     # 실행중인 인스턴스 제외하고 판단    
-    PreferedLambda = np.array(list(PerformLambda.values())) > EventValues
-    LambdaPreferRatio = len(PreferedLambda[PreferedLambda == True]) / len(PreferedLambda)
-    print(LambdaPreferRatio)
-    MDCQueue = []
+    RemainPreferedLambda = np.array(list(PerformLambda.values())) > ComparedEventValues
+    RemainLambdaRatio = len(RemainPreferedLambda[RemainPreferedLambda == True]) / len(RemainPreferedLambda)
+    print("RemainLambdaRatio:",RemainLambdaRatio)
+
+    TotalPreferedLambda = np.array(list(PerformLambda.values())) > TotalEventValues
+    TotalLambdaRatio = len(TotalPreferedLambda[TotalPreferedLambda == True]) / len(TotalPreferedLambda)
+    print("TotalLambdaRatio:",TotalLambdaRatio)
     
-    # 이벤트 값이 마이너스가 된다면 인스턴스 종료
-    if len(EventValues[EventValues < 0]) > 0:
-        InferentiaInstances -= 1
                  
-    elif LambdaPreferRatio <= 0.5:
+    if RemainLambdaRatio <= 0.5:
         # 인스턴스를 추가로 켜야하는 경우
         InferentiaInstances += 1
-        # Inferentia Queue에 Event를 담기
-        
-        # M/D/C Ququeing Model 활용
     
+    # 더이상 인스턴스가 필요없는 경우
+    if TotalLambdaRatio > 0.5:
+        InferentiaInstance -= 1
     else:
         LambdaWorkers += Events[1]
     
